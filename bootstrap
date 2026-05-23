@@ -543,6 +543,11 @@ _ssh_config_include() {
     echo "$marker_start"
     echo "Include dev-env.conf"
     echo "$marker_end"
+    echo ""
+    echo "# >>> user >>>"
+    echo "Include user.conf"
+    echo "# <<< user <<<"
+    echo ""
     if [ -f "$conf" ] ; then cat "$conf" ; fi
   } > "${conf}.new"
 
@@ -757,6 +762,14 @@ Host *
 EOF
   fi
   chmod 600 "$HOME/.ssh/dev-env.conf"
+
+  if [ ! -f "$HOME/.ssh/user.conf" ] ; then
+    cat > "$HOME/.ssh/user.conf" <<'EOF'
+# User-managed SSH config. Add your Host blocks and IdentityFile directives here.
+# This file is created by dev-env bootstrap but never overwritten on re-run.
+EOF
+    chmod 600 "$HOME/.ssh/user.conf"
+  fi
 
   _ssh_config_include
 
