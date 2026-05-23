@@ -1,0 +1,1400 @@
+#!/bin/bash
+#
+# bootstrap — platform-agnostic dev-env setup
+#
+#   Supports: macOS (Apple Silicon) and Debian/Ubuntu
+#
+# Sources user overrides (if present) from ~/.config/dev-env/config.
+# Defaults for all 23 DEVENV_* vars live in the manifest below and are
+# applied at startup; the user file only needs to list the values you
+# want to override. See the rendered table at the bottom of --help.
+#
+# Usage:
+#   ./bootstrap                Install all 25 deps; prompts for confirmation
+#                              after showing effective configuration
+#   ./bootstrap --yes          Same, but skip the confirmation prompt
+#   ./bootstrap --init-config  Write a starter ~/.config/dev-env/config
+#                              template (refuses to overwrite without --force)
+#   ./bootstrap --help         Show this message + the configuration table
+#
+# Installs 25 dev tools, writes shell env fragments, and prints next-steps
+# after completion.
+#
+# Re-runnable: brew/apt installs are natively idempotent; tarball deps
+# use version markers; rc-block and ssh-config-include use marker blocks;
+# gpg-agent.conf and gradle.properties merges are idempotent.
+#
+# All 23 DEVENV_* variables, their defaults, and their descriptions live in
+# the manifest (see "DEVENV_* manifest" section below). The manifest is the
+# single source of truth — `--help` prints the table from it, `--init-config`
+# generates the template from it, and the pre-bootstrap confirmation table
+# reads from it. Defaults are applied at startup via _apply_devenv_defaults
+# so usage sites can read bare `$DEVENV_<NAME>` (no `:-default` fallbacks).
+
+set -euo pipefail
+
+
+# =============================================================================
+# DEVENV_* manifest — single source of truth for all 23 config variables.
+# Each entry: NAME, CATEGORY, DEFAULT, EXAMPLE, DESCRIPTION, PLACEHOLDER.
+#   DEFAULT     — literal applied at startup by _apply_devenv_defaults.
+#                 Empty = "skip if unset" semantics: var stays empty; usage
+#                 sites guard with `[ -n "$VAR" ]` and skip.
+#   EXAMPLE     — value shown in --init-config template (commented out).
+#   DESCRIPTION — one-line description shown in --help table.
+#   PLACEHOLDER — text shown in the effective-config table for empty-default
+#                 vars when the user did not set them.
+# =============================================================================
+
+_DEVENV_NAMES=()
+_DEVENV_CATEGORIES=()
+_DEVENV_DEFAULTS=()
+_DEVENV_EXAMPLES=()
+_DEVENV_DESCRIPTIONS=()
+_DEVENV_PLACEHOLDERS=()
+
+_devenv_add() {
+  _DEVENV_NAMES+=("$1")
+  _DEVENV_CATEGORIES+=("$2")
+  _DEVENV_DEFAULTS+=("$3")
+  _DEVENV_EXAMPLES+=("$4")
+  _DEVENV_DESCRIPTIONS+=("$5")
+  _DEVENV_PLACEHOLDERS+=("$6")
+}
+
+#            NAME                    CATEGORY                DEFAULT        EXAMPLE                 DESCRIPTION                                                              PLACEHOLDER
+_devenv_add  GIT_NAME                "Identity"              ""             "Your Name"             "Sets user.name globally"                                                 "<unset>"
+_devenv_add  GIT_EMAIL               "Identity"              ""             "you@example.com"       "Sets user.email globally"                                                "<unset>"
+_devenv_add  GIT_SIGNING_KEY         "Identity"              ""             ""                      "Sets user.signingkey + commit.gpgsign=true (GPG key ID, long form)"      "<unset>"
+_devenv_add  GIT_DEFAULT_BRANCH      "Identity"              ""             ""                      "Sets init.defaultBranch (e.g. main / trunk / master)"                    "<unset -- git's compiled default>"
+_devenv_add  GPG_KEY_PATH            "Secret key paths"      ""             "\$HOME/.keys/git.gpg"  "File path; imported via gpg --batch --import"                            "<unset -- skip GPG import>"
+_devenv_add  SSH_KEY_PATH            "Secret key paths"      ""             "\$HOME/.keys/git.ssh"  "File path; added via ssh-add (+ --apple-use-keychain on Mac)"            "<unset -- skip SSH import>"
+_devenv_add  GRADLE_VER              "Version pins"          "9.5.1"        "9.5.1"                 "Gradle tarball version (Ubuntu apt lags 5 majors)"                       ""
+_devenv_add  LLVM_MAJOR              "Version pins"          "21"           "21"                    "apt.llvm.org major on Debian (21 stable / 22 qualification / 23 dev)"    ""
+_devenv_add  NODE_MAJOR              "Version pins"          "24"           "24"                    "Node LTS major (both OSes)"                                              ""
+_devenv_add  RUST_PROFILE            "Version pins"          "default"      "default"               "rustup --profile: minimal / default / complete"                          ""
+_devenv_add  JDKS_DEFAULT            "Runtime preferences"   "adoptium-21"  "adoptium-21"           "Which JDK JAVA_HOME points to: adoptium-21 / adoptium-25 / graalvm-25"   ""
+_devenv_add  CCACHE_TRANSPARENT      "Runtime preferences"   "false"        "false"                 "Prepend ccache symlinks to PATH for transparent caching"                 ""
+_devenv_add  COLIMA_CPUS             "Colima VM (macOS)"     "4"            "4"                     ""                                                                        ""
+_devenv_add  COLIMA_MEMORY           "Colima VM (macOS)"     "8"            "8"                     "GiB"                                                                     ""
+_devenv_add  COLIMA_DISK             "Colima VM (macOS)"     "100"          "100"                   "GiB"                                                                     ""
+_devenv_add  COLIMA_AUTOSTART        "Colima VM (macOS)"     "false"        "false"                 "brew services start colima (auto-start VM at login)"                     ""
+_devenv_add  COLIMA_KUBERNETES       "Colima VM (macOS)"     "false"        "false"                 "colima start --kubernetes (single-node k8s in VM)"                       ""
+_devenv_add  OLLAMA_HOST             "Ollama"                ""             "0.0.0.0:11434"         "Bind address; non-default required for LAN/container access"             "<unset -- bind 127.0.0.1:11434>"
+_devenv_add  OLLAMA_FLASH_ATTENTION  "Ollama"                "1"            "1"                     "Flash Attention on Apple Silicon (per brew caveat)"                      ""
+_devenv_add  OLLAMA_KV_CACHE_TYPE    "Ollama"                "q8_0"         "q8_0"                  "8-bit KV cache quantization (per brew caveat)"                           ""
+_devenv_add  OLLAMA_AUTOSTART        "Ollama"                "false"        "false"                 "brew services / systemctl enable --now"                                  ""
+_devenv_add  OLLAMA_MODELS_DIR       "Ollama"                ""             ""                      "Redirect to other disk (default: ~/.ollama/models)"                      "<unset -- use ollama default>"
+_devenv_add  VLLM_INSTALL            "vllm"                  "false"        "false"                 "Opt-in for vllm install (~5-10 GB)"                                      ""
+
+
+# =============================================================================
+# Manifest consumers — apply defaults / drift-lint / 3 display tables
+# =============================================================================
+
+# Apply manifest defaults to DEVENV_* vars. Call AFTER sourcing user config.
+# For empty-default entries, this leaves the var empty but defined (so bare
+# `$DEVENV_<NAME>` doesn't trip set -u at usage sites).
+_apply_devenv_defaults() {
+  local i name default full
+  for i in "${!_DEVENV_NAMES[@]}" ; do
+    name="${_DEVENV_NAMES[$i]}"
+    default="${_DEVENV_DEFAULTS[$i]}"
+    full="DEVENV_$name"
+    eval "$full=\"\${$full:-$default}\""
+  done
+}
+
+# Drift check: every DEVENV_* referenced in this script must be in the manifest.
+# Cheap single grep; runs on every invocation. Catches typos and forgotten
+# manifest entries.
+_lint_manifest() {
+  local manifest_set=" " var i missing=""
+  for i in "${!_DEVENV_NAMES[@]}" ; do
+    manifest_set="${manifest_set}DEVENV_${_DEVENV_NAMES[$i]} "
+  done
+  for var in $(grep -hoE '\bDEVENV_[A-Z][A-Z_]*[A-Z]\b' "${BASH_SOURCE[0]}" | sort -u || true) ; do
+    case "$manifest_set" in
+      *" $var "*) ;;
+      *) missing="$missing $var" ;;
+    esac
+  done
+  if [ -n "$missing" ] ; then
+    echo "bootstrap: DEVENV_* drift detected — referenced but missing from manifest:" >&2
+    for v in $missing ; do echo "  $v" >&2 ; done
+    echo "bootstrap: add the missing var(s) via _devenv_add near the top of bootstrap." >&2
+    exit 1
+  fi
+}
+
+# Print the CONFIGURATION VARIABLES reference table (used by --help).
+_show_config_reference() {
+  echo
+  echo "================================================================"
+  echo "  CONFIGURATION VARIABLES"
+  echo "  (override in ~/.config/dev-env/config — run --init-config for a starter template)"
+  echo "================================================================"
+  local i name category default description display current_category=""
+  for i in "${!_DEVENV_NAMES[@]}" ; do
+    name="${_DEVENV_NAMES[$i]}"
+    category="${_DEVENV_CATEGORIES[$i]}"
+    default="${_DEVENV_DEFAULTS[$i]}"
+    description="${_DEVENV_DESCRIPTIONS[$i]}"
+    if [ "$category" != "$current_category" ] ; then
+      echo
+      echo "  --- $category ---"
+      current_category="$category"
+    fi
+    if [ -n "$default" ] ; then
+      display="\"$default\""
+    else
+      display="(unset)"
+    fi
+    printf '    %-32s %-16s %s\n' "DEVENV_$name" "$display" "$description"
+  done
+  echo
+}
+
+# Print the effective-config table (post-source, post-apply-defaults).
+_show_effective_config() {
+  echo
+  echo "================================================================"
+  echo "  effective configuration"
+  echo "  (sourced from $_config_dir/config; unset vars show default)"
+  echo "================================================================"
+  local i name category default placeholder full val current_category=""
+  for i in "${!_DEVENV_NAMES[@]}" ; do
+    name="${_DEVENV_NAMES[$i]}"
+    category="${_DEVENV_CATEGORIES[$i]}"
+    default="${_DEVENV_DEFAULTS[$i]}"
+    placeholder="${_DEVENV_PLACEHOLDERS[$i]}"
+    full="DEVENV_$name"
+    if [ "$category" != "$current_category" ] ; then
+      [ -n "$current_category" ] && echo
+      echo "  $category"
+      current_category="$category"
+    fi
+    val="$(eval "printf '%s' \"\${$full:-}\"")"
+    if [ -n "$val" ] && [ -n "$default" ] && [ "$val" = "$default" ] ; then
+      printf '  %-32s %-32s (default)\n' "$full" "$default"
+    elif [ -n "$val" ] ; then
+      printf '  %-32s %s\n' "$full" "$val"
+    elif [ -n "$placeholder" ] ; then
+      printf '  %-32s %-32s (default)\n' "$full" "$placeholder"
+    else
+      printf '  %-32s %-32s (default)\n' "$full" "<unset>"
+    fi
+  done
+  echo
+  echo "================================================================"
+  echo
+}
+
+
+# =============================================================================
+# CLI argument parsing (must come before any OS detection / config sourcing
+# so --init-config and --help work even on an environment that would fail the
+# arch/OS guards in _base_).
+# =============================================================================
+
+_usage() {
+  # Print the leading comment block (everything up to set -euo pipefail).
+  awk '/^[^#]/ && !/^$/ { exit } { print }' "${BASH_SOURCE[0]}"
+  _show_config_reference
+}
+
+# Generate ~/.config/dev-env/config from the manifest. Refuses to overwrite
+# without --force.
+_init_config() {
+  local target="$HOME/.config/dev-env/config"
+  local force="${1:-}"
+
+  if [ -e "$target" ] && [ "$force" != "--force" ] ; then
+    echo "bootstrap: $target already exists." >&2
+    echo "bootstrap: use --force to overwrite, or edit it directly." >&2
+    return 1
+  fi
+
+  mkdir -p "$(dirname "$target")"
+  {
+    echo "# ~/.config/dev-env/config — user overrides for dev-env bootstrap"
+    echo "#"
+    echo "# Uncomment + edit the variables you want to override."
+    echo "# Run \`./bootstrap --help\` for the authoritative table of defaults + descriptions."
+    local i name category example description current_category=""
+    for i in "${!_DEVENV_NAMES[@]}" ; do
+      name="${_DEVENV_NAMES[$i]}"
+      category="${_DEVENV_CATEGORIES[$i]}"
+      example="${_DEVENV_EXAMPLES[$i]}"
+      description="${_DEVENV_DESCRIPTIONS[$i]}"
+      if [ "$category" != "$current_category" ] ; then
+        echo
+        echo "# --- $category ---"
+        current_category="$category"
+      fi
+      if [ -n "$description" ] ; then
+        printf '#DEVENV_%s="%s"  # %s\n' "$name" "$example" "$description"
+      else
+        printf '#DEVENV_%s="%s"\n' "$name" "$example"
+      fi
+    done
+  } > "$target"
+  chmod 600 "$target"
+  echo "bootstrap: wrote $target"
+  echo "bootstrap: edit the file, uncomment + customize values you want to override."
+}
+
+# Drift check runs on every invocation (cheap: single grep over this file).
+_lint_manifest
+
+
+# Skip-confirm flag (set by --yes/-y); checked by _confirm_proceed before deps loop
+__yes=false
+
+while [ "$#" -gt 0 ] ; do
+  case "$1" in
+    --init-config)
+      shift
+      _init_config "${1:-}"
+      exit $?
+      ;;
+    --help|-h)
+      _usage
+      exit 0
+      ;;
+    --yes|-y)
+      __yes=true
+      shift
+      ;;
+    *)
+      echo "bootstrap: unknown argument '$1'" >&2
+      echo "Try: ./bootstrap --help" >&2
+      exit 1
+      ;;
+  esac
+done
+
+
+# =============================================================================
+# OS detection
+# =============================================================================
+
+_is_mac()    { [[ "${OSTYPE:-}" == darwin* ]]; }
+_is_debian() {
+  ! _is_mac && [ -f /etc/os-release ] && \
+    ( . /etc/os-release && [[ "${ID:-}" =~ ^(ubuntu|debian)$ ]] )
+}
+
+
+# =============================================================================
+# System constants
+# =============================================================================
+
+_os_codename=""
+if _is_debian ; then
+  _os_codename="$(. /etc/os-release && echo "${VERSION_CODENAME:-}")"
+fi
+
+_install_root="$HOME/.local/share/dev-env"
+_user_bin="$HOME/.local/bin"
+_config_dir="$HOME/.config/dev-env"
+_env_d="$_config_dir/env.d"
+_env_loader="$_config_dir/env.sh"
+
+# Holds PID of the background sudo-cache refresher started by _sys_ on Linux.
+# Initialized empty so the EXIT trap doesn't trip on set -u.
+__sudo_refresh_pid=""
+
+
+# =============================================================================
+# Source user config overrides, then apply manifest defaults to fill in any
+# DEVENV_* not set by the user. After this, every DEVENV_* exists in scope
+# (with its default or empty) so usage sites can read bare `$DEVENV_<NAME>`.
+# =============================================================================
+
+if [ -f "$_config_dir/config" ] ; then
+  # shellcheck disable=SC1091
+  . "$_config_dir/config"
+fi
+
+_apply_devenv_defaults
+
+
+# =============================================================================
+# Helpers — install primitives
+# =============================================================================
+
+# _pkg brew:NAME apt:NAME  (multiple of each accepted)
+_pkg() {
+  local arg
+  for arg in "$@" ; do
+    case "$arg" in
+      brew:*) if _is_mac ;    then brew install "${arg#brew:}"             ; fi ;;
+      apt:*)  if _is_debian ; then sudo apt-get install -y "${arg#apt:}"   ; fi ;;
+      *) echo "_pkg: unknown spec '$arg' (expected brew:NAME or apt:NAME)" >&2 ; return 1 ;;
+    esac
+  done
+}
+
+# _cask NAME  (macOS only; no-op on Linux)
+_cask() {
+  if _is_mac ; then brew install --cask "$1" ; fi
+}
+
+# _tarball <relpath> <ver> [mac:URL] [deb:URL] [all:URL]
+#   Installs to $_install_root/<relpath>.  Writes <relpath>/.version marker
+#   for idempotency.  Strips one top-level dir from the archive.
+_tarball() {
+  local relpath="$1"; shift
+  local ver="$1"; shift
+  local dest="$_install_root/$relpath"
+
+  local url="" arg
+  for arg in "$@" ; do
+    case "$arg" in
+      mac:*) if _is_mac ;    then url="${arg#mac:}" ; fi ;;
+      deb:*) if _is_debian ; then url="${arg#deb:}" ; fi ;;
+      all:*) url="${arg#all:}" ;;
+      *) echo "_tarball: unknown spec '$arg'" >&2 ; return 1 ;;
+    esac
+  done
+
+  if [ -z "$url" ] ; then
+    echo "_tarball: no URL for current OS in '$relpath'" >&2
+    return 1
+  fi
+
+  if [ -f "$dest/.version" ] && [ "$(cat "$dest/.version")" = "$ver" ] ; then
+    return 0
+  fi
+
+  echo "_tarball: installing $relpath @ $ver"
+  rm -rf "$dest"
+  mkdir -p "$dest"
+
+  local tmp; tmp="$(mktemp -d)"
+  local archive="$tmp/archive"
+  curl -fsSL "$url" -o "$archive"
+
+  case "$url" in
+    *.tar.gz|*.tgz)  tar -xzf "$archive" -C "$tmp" ;;
+    *.tar.xz)        tar -xJf "$archive" -C "$tmp" ;;
+    *.tar.bz2)       tar -xjf "$archive" -C "$tmp" ;;
+    *.zip)           unzip -q "$archive" -d "$tmp" ;;
+    *) echo "_tarball: unknown archive format for '$url'" >&2 ; rm -rf "$tmp" ; return 1 ;;
+  esac
+  rm -f "$archive"
+
+  # Strip one top-level dir
+  local extracted="" entry
+  for entry in "$tmp"/*/ ; do
+    extracted="$entry"
+    break
+  done
+
+  if [ -z "$extracted" ] || [ ! -d "$extracted" ] ; then
+    echo "_tarball: no extracted top-level dir found" >&2
+    rm -rf "$tmp"
+    return 1
+  fi
+
+  ( cd "$extracted" && for entry in * ; do mv -- "$entry" "$dest/" ; done )
+
+  rm -rf "$tmp"
+  echo "$ver" > "$dest/.version"
+}
+
+# _apt_repo <name> <gpg-key-url> <repo-spec>
+#   repo-spec is everything after "deb " in the sources.list line,
+#   e.g. "https://download.docker.com/linux/ubuntu noble stable"
+#   Uses signed-by keyring in /etc/apt/keyrings/.
+_apt_repo() {
+  if ! _is_debian ; then return 0 ; fi
+
+  local name="$1" gpg_url="$2" repo_spec="$3"
+  local keyring="/etc/apt/keyrings/${name}.gpg"
+  local sources="/etc/apt/sources.list.d/${name}.list"
+
+  sudo install -d -m 0755 /etc/apt/keyrings
+
+  local tmp; tmp="$(mktemp)"
+  curl -fsSL "$gpg_url" -o "$tmp"
+  if head -c 100 "$tmp" | grep -q "BEGIN" ; then
+    gpg --dearmor < "$tmp" | sudo tee "$keyring" >/dev/null
+  else
+    sudo install -m 0644 "$tmp" "$keyring"
+  fi
+  rm -f "$tmp"
+
+  echo "deb [signed-by=${keyring}] ${repo_spec}" | sudo tee "$sources" >/dev/null
+  sudo apt-get update
+}
+
+
+# =============================================================================
+# Helpers — config and env-fragment management
+# =============================================================================
+
+# _env_fragment <name> <line1> [<line2> ...]   (positional args mode)
+# _env_fragment <name>                          (heredoc on stdin mode)
+_env_fragment() {
+  local name="$1"; shift
+  local file="$_env_d/${name}.sh"
+  mkdir -p "$_env_d"
+  if [ "$#" -eq 0 ] ; then
+    cat > "$file"
+  else
+    printf '%s\n' "$@" > "$file"
+  fi
+}
+
+# _link_bin <relpath> <name>...
+#   Symlinks $_install_root/<relpath>/<name> -> $_user_bin/<name>
+_link_bin() {
+  local relpath="$1"; shift
+  local src_dir="$_install_root/$relpath"
+  mkdir -p "$_user_bin"
+  local bin
+  for bin in "$@" ; do
+    ln -sfn "$src_dir/$bin" "$_user_bin/$bin"
+  done
+}
+
+# _gpg_agent_conf_set <key> <value>
+#   Idempotently sets "key value" (space-separated) in ~/.gnupg/gpg-agent.conf
+_gpg_agent_conf_set() {
+  local key="$1" value="$2"
+  local file="$HOME/.gnupg/gpg-agent.conf"
+  mkdir -p "$HOME/.gnupg"
+  chmod 700 "$HOME/.gnupg"
+  touch "$file"
+  chmod 600 "$file"
+  if grep -q "^${key} " "$file" 2>/dev/null ; then
+    sed -i.bak "s#^${key} .*#${key} ${value}#" "$file"
+    rm -f "${file}.bak"
+  else
+    printf '%s %s\n' "$key" "$value" >> "$file"
+  fi
+}
+
+# _gradle_properties_set <key> <value>
+#   Idempotently sets "key=value" in ~/.gradle/gradle.properties
+_gradle_properties_set() {
+  local key="$1" value="$2"
+  local file="$HOME/.gradle/gradle.properties"
+  mkdir -p "$(dirname "$file")"
+  touch "$file"
+  if grep -q "^${key}=" "$file" 2>/dev/null ; then
+    sed -i.bak "s#^${key}=.*#${key}=${value}#" "$file"
+    rm -f "${file}.bak"
+  else
+    printf '%s=%s\n' "$key" "$value" >> "$file"
+  fi
+}
+
+# _discover_jdks
+#   Emit one JDK home path per line by scanning OS-standard locations.
+#   Filters to candidates with executable bin/java.
+_discover_jdks() {
+  local h prefix
+  if _is_mac ; then
+    if [ -x /usr/libexec/java_home ] ; then
+      /usr/libexec/java_home -V 2>&1 \
+        | grep -oE '/[^"]*/Contents/Home$' \
+        | while read -r h ; do
+            if [ -x "$h/bin/java" ] ; then printf '%s\n' "$h" ; fi
+          done
+    fi
+    for h in /Library/Java/JavaVirtualMachines/*/Contents/Home ; do
+      if [ -d "$h" ] && [ -x "$h/bin/java" ] ; then printf '%s\n' "$h" ; fi
+    done
+    if command -v brew >/dev/null 2>&1 ; then
+      prefix="$(brew --prefix 2>/dev/null || true)"
+      if [ -n "$prefix" ] ; then
+        for h in "$prefix"/opt/openjdk*/libexec/openjdk.jdk/Contents/Home ; do
+          if [ -d "$h" ] && [ -x "$h/bin/java" ] ; then printf '%s\n' "$h" ; fi
+        done
+      fi
+    fi
+  else
+    for h in /usr/lib/jvm/*/ ; do
+      h="${h%/}"
+      if [ -d "$h" ] && [ ! -L "$h" ] && [ -x "$h/bin/java" ] ; then printf '%s\n' "$h" ; fi
+    done
+    for h in "$HOME"/.local/share/dev-env/jdks/*/ ; do
+      h="${h%/}"
+      if [ -d "$h" ] && [ -x "$h/bin/java" ] ; then printf '%s\n' "$h" ; fi
+    done
+  fi
+}
+
+# _ssh_config_include
+#   Inject "Include dev-env.conf" block at top of ~/.ssh/config (idempotent).
+_ssh_config_include() {
+  local conf="$HOME/.ssh/config"
+  local marker_start="# >>> dev-env >>>"
+  local marker_end="# <<< dev-env <<<"
+
+  if [ -f "$conf" ] && grep -q "$marker_start" "$conf" ; then
+    return 0
+  fi
+
+  {
+    echo "$marker_start"
+    echo "Include dev-env.conf"
+    echo "$marker_end"
+    if [ -f "$conf" ] ; then cat "$conf" ; fi
+  } > "${conf}.new"
+
+  mv "${conf}.new" "$conf"
+  chmod 600 "$conf"
+}
+
+# _write_rc_block <file>
+#   Replace or append the dev-env marker block in <file>.
+_write_rc_block() {
+  local file="$1"
+  local marker_start="# >>> dev-env >>>"
+  local marker_end="# <<< dev-env <<<"
+
+  touch "$file"
+
+  if grep -q "$marker_start" "$file" 2>/dev/null ; then
+    sed -i.bak "/^${marker_start}\$/,/^${marker_end}\$/d" "$file"
+    rm -f "${file}.bak"
+  fi
+
+  cat >> "$file" <<RC_BLOCK
+${marker_start}
+[ -f "\$HOME/.config/dev-env/env.sh" ] && . "\$HOME/.config/dev-env/env.sh"
+${marker_end}
+RC_BLOCK
+}
+
+
+# =============================================================================
+# Dep functions
+# =============================================================================
+
+_base_() {
+  # ---- Root-refusal (Issue #8) ----
+  if [ "$EUID" -eq 0 ] ; then
+    echo "bootstrap: do not run as root or with sudo." >&2
+    echo "bootstrap: this script does user-scope work in \$HOME; running as root puts everything in /root." >&2
+    echo "bootstrap: invoke as your normal user; the script will prompt for sudo only when needed." >&2
+    exit 1
+  fi
+
+  # ---- Arch / OS guard (Issue #7) ----
+  if _is_mac ; then
+    if [ "$(uname -m)" != "arm64" ] ; then
+      echo "bootstrap: this script supports Apple Silicon (arm64) only." >&2
+      echo "bootstrap: detected '$(uname -m)' on macOS. Aborting." >&2
+      exit 1
+    fi
+  elif _is_debian ; then
+    :  # ok
+  else
+    echo "bootstrap: unsupported OS. Supports macOS (Apple Silicon) and Debian/Ubuntu only." >&2
+    if [ -f /etc/os-release ] ; then
+      echo "bootstrap: detected $(. /etc/os-release && echo "${ID:-unknown} ${VERSION_ID:-?}"). Aborting." >&2
+    else
+      echo "bootstrap: detected '${OSTYPE:-}'. Aborting." >&2
+    fi
+    exit 1
+  fi
+
+  # ---- Directories ----
+  mkdir -p "$_install_root" "$_user_bin" "$_env_d"
+
+  # ---- Fragment loader ----
+  cat > "$_env_loader" <<'LOADER'
+# dev-env env loader — sourced by ~/.zshrc / ~/.bashrc / ~/.bash_profile
+for __f in "$HOME"/.config/dev-env/env.d/*.sh ; do
+  [ -r "$__f" ] && . "$__f"
+done
+unset __f
+case ":$PATH:" in
+  *":$HOME/.local/bin:"*) ;;
+  *) PATH="$HOME/.local/bin:$PATH" ;;
+esac
+export PATH
+LOADER
+
+  # ---- macOS-only brew shellenv fragment ----
+  if _is_mac ; then
+    _env_fragment 00-brew 'eval "$(/opt/homebrew/bin/brew shellenv)"'
+  fi
+
+  # ---- rc-block in the user's login shell rc file ----
+  local login_shell rc_file
+  login_shell="$(basename "${SHELL:-/bin/bash}")"
+  case "$login_shell" in
+    zsh)
+      rc_file="$HOME/.zshrc"
+      ;;
+    bash)
+      if _is_mac ; then rc_file="$HOME/.bash_profile" ; else rc_file="$HOME/.bashrc" ; fi
+      ;;
+    *)
+      if _is_mac ; then rc_file="$HOME/.zshrc" ; else rc_file="$HOME/.bashrc" ; fi
+      echo "_base_: unknown login shell '$login_shell'; writing rc-block to '$rc_file' as best effort." >&2
+      echo "_base_: you may need to source ~/.config/dev-env/env.sh manually from your shell config." >&2
+      ;;
+  esac
+  _write_rc_block "$rc_file"
+}
+
+_sys_() {
+  if _is_mac ; then
+    # 1. Xcode Command Line Tools
+    if ! xcode-select -p >/dev/null 2>&1 ; then
+      echo "_sys_: installing Xcode Command Line Tools (interactive GUI prompt)..."
+      xcode-select --install
+      until xcode-select -p >/dev/null 2>&1 ; do
+        sleep 5
+      done
+    fi
+
+    # 2. Homebrew (the only path is the official curl-piped-to-bash)
+    if ! command -v brew >/dev/null 2>&1 ; then
+      echo "_sys_: installing Homebrew (interactive — installer pauses for confirmation)..."
+      /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+    fi
+
+    # 3. Activate brew in this bash session
+    if [ -d /opt/homebrew/bin ] ; then
+      eval "$(/opt/homebrew/bin/brew shellenv)"
+    fi
+  else
+    # ---- Sudo policy (Issue #3): prime cache + background refresher ----
+    if ! sudo -n true 2>/dev/null ; then
+      sudo -v
+    fi
+    while true ; do sudo -n true 2>/dev/null ; sleep 50 ; done &
+    __sudo_refresh_pid=$!
+    trap 'kill "$__sudo_refresh_pid" 2>/dev/null || true' EXIT
+
+    # ---- Foundational packages ----
+    # python3-venv: required by _hf_ (hf's installer uses `python3 -m venv`;
+    # Ubuntu strips ensurepip from the default python3 install).
+    # python3-pip:  standard system pip; paired with venv for general Python work.
+    # unzip / zip:  unzip required by _tarball for .zip archives (e.g., gradle);
+    #               neither in default Ubuntu Server image. Paired for symmetry.
+    sudo apt-get update
+    sudo apt-get install -y build-essential curl ca-certificates gnupg \
+      python3-venv python3-pip unzip zip
+  fi
+}
+
+_bash_() {
+  # macOS only: brew bash 5+ alongside system /bin/bash 3.2 (frozen by Apple at GPLv3 boundary).
+  # Linux already has modern bash via apt; skip there.
+  # User can `chsh -s /opt/homebrew/bin/bash` after manually adding it to /etc/shells.
+  if _is_mac ; then
+    _pkg brew:bash
+  fi
+}
+
+_gpg_() {
+  _pkg brew:gnupg apt:gnupg
+
+  local pinentry
+  if _is_mac ; then
+    brew install pinentry-mac
+    pinentry="$(brew --prefix)/bin/pinentry-mac"
+  else
+    sudo apt-get install -y pinentry-gtk2
+    pinentry="/usr/bin/pinentry-gtk2"
+  fi
+
+  mkdir -p "$HOME/.gnupg"
+  chmod 700 "$HOME/.gnupg"
+  _gpg_agent_conf_set pinentry-program "$pinentry"
+
+  # Conditional key import (graceful skip if not configured)
+  if [ -n "$DEVENV_GPG_KEY_PATH" ] && [ -f "$DEVENV_GPG_KEY_PATH" ] ; then
+    gpg --batch --import "$DEVENV_GPG_KEY_PATH"
+    # Auto-set ultimate ownertrust on the user's own key (gpg does NOT auto-trust imported keys).
+    # --import-ownertrust requires the full 40-char fingerprint, not the short key ID
+    # (which is what DEVENV_GIT_SIGNING_KEY typically holds, since git accepts either).
+    if [ -n "$DEVENV_GIT_SIGNING_KEY" ] ; then
+      local fpr
+      fpr="$(gpg --list-secret-keys --with-colons --fingerprint "$DEVENV_GIT_SIGNING_KEY" 2>/dev/null \
+             | awk -F: '/^fpr:/ {print $10; exit}')"
+      if [ -n "$fpr" ] ; then
+        echo "${fpr}:6:" | gpg --import-ownertrust
+      else
+        echo "_gpg_: could not resolve fingerprint for '$DEVENV_GIT_SIGNING_KEY' — skipping auto-trust" >&2
+      fi
+    fi
+  fi
+
+  gpg-connect-agent reloadagent /bye >/dev/null 2>&1 || true
+  _env_fragment gpg 'export GPG_TTY="$(tty)"'
+}
+
+_ssh_() {
+  if ! _is_mac ; then
+    _pkg apt:openssh-client
+  fi
+
+  mkdir -p "$HOME/.ssh"
+  chmod 700 "$HOME/.ssh"
+
+  if _is_mac ; then
+    cat > "$HOME/.ssh/dev-env.conf" <<'EOF'
+# Managed by dev-env bootstrap. Do not edit — re-run ./bootstrap to update.
+Host *
+  AddKeysToAgent yes
+  UseKeychain yes
+EOF
+  else
+    cat > "$HOME/.ssh/dev-env.conf" <<'EOF'
+# Managed by dev-env bootstrap. Do not edit — re-run ./bootstrap to update.
+Host *
+  AddKeysToAgent yes
+EOF
+  fi
+  chmod 600 "$HOME/.ssh/dev-env.conf"
+
+  _ssh_config_include
+
+  # Optional: register user's SSH key with the agent
+  if [ -n "$DEVENV_SSH_KEY_PATH" ] && [ -f "$DEVENV_SSH_KEY_PATH" ] ; then
+    chmod 600 "$DEVENV_SSH_KEY_PATH" 2>/dev/null || true
+    if _is_mac ; then
+      ssh-add --apple-use-keychain "$DEVENV_SSH_KEY_PATH"
+    else
+      ssh-add "$DEVENV_SSH_KEY_PATH"
+    fi
+  fi
+}
+
+_git_() {
+  _pkg brew:git apt:git
+
+  if [ -n "$DEVENV_GIT_NAME" ] ; then
+    git config --global user.name "$DEVENV_GIT_NAME"
+  fi
+  if [ -n "$DEVENV_GIT_EMAIL" ] ; then
+    git config --global user.email "$DEVENV_GIT_EMAIL"
+  fi
+  if [ -n "$DEVENV_GIT_SIGNING_KEY" ] ; then
+    git config --global user.signingkey "$DEVENV_GIT_SIGNING_KEY"
+    git config --global commit.gpgsign true
+  fi
+  if [ -n "$DEVENV_GIT_DEFAULT_BRANCH" ] ; then
+    git config --global init.defaultBranch "$DEVENV_GIT_DEFAULT_BRANCH"
+  fi
+}
+
+_gh_() { _pkg brew:gh apt:gh ; }
+
+_hf_() {
+  # Hugging Face CLI — replaces deprecated `huggingface-cli`.
+  # Official installer on both OSes: creates isolated venv internally + single
+  # binary at ~/.local/bin/hf. Same outcome on Mac and Linux (no GUI, no sudo).
+  # --no-modify-path keeps it from touching shell rc — we own PATH via env loader.
+  # Sibling to `_python_`/uv in design shape (fast-moving CLI, self-update works).
+  # NOTE: the upstream installer prints "[ERROR]" but exits 0 if venv creation
+  # fails (e.g., missing python3-venv on Ubuntu) — we double-check the binary
+  # exists post-install to surface that as a real failure.
+  if [ ! -x "$HOME/.local/bin/hf" ] ; then
+    curl -LsSf https://hf.co/cli/install.sh | bash -s -- --no-modify-path
+    if [ ! -x "$HOME/.local/bin/hf" ] ; then
+      echo "_hf_: install reported success but $HOME/.local/bin/hf is missing." >&2
+      echo "_hf_: check the output above; on Ubuntu, ensure python3-venv is installed." >&2
+      return 1
+    fi
+  fi
+}
+
+_ccache_() {
+  _pkg brew:ccache apt:ccache
+  mkdir -p "$HOME/.cache/ccache"
+
+  if [ "$DEVENV_CCACHE_TRANSPARENT" = "true" ] ; then
+    # Transparent mode: prepend ccache's compiler-symlink dir to PATH so
+    # every clang/gcc/cc/c++ call silently goes through ccache.
+    local ccache_libexec
+    if _is_mac ; then
+      ccache_libexec="$(brew --prefix ccache)/libexec"
+    else
+      ccache_libexec="/usr/lib/ccache"
+    fi
+    # Export CCACHE_LIBEXEC so llvm_activate (and anything else that mutates PATH)
+    # can detect where ccache lives and insert *after* it, keeping ccache first.
+    _env_fragment ccache \
+      'export CCACHE_DIR="$HOME/.cache/ccache"' \
+      "export CCACHE_LIBEXEC=\"${ccache_libexec}\"" \
+      'export PATH="$CCACHE_LIBEXEC:$PATH"'
+  else
+    _env_fragment ccache 'export CCACHE_DIR="$HOME/.cache/ccache"'
+  fi
+}
+
+_cmake_() { _pkg brew:cmake apt:cmake ; }
+
+_ninja_() { _pkg brew:ninja apt:ninja-build ; }
+
+_boost_() { _pkg brew:boost apt:libboost-all-dev ; }
+
+_llvm_() {
+  if _is_mac ; then
+    # lld is a separate brew formula per brew's llvm caveat
+    brew install llvm lld
+    _env_fragment llvm <<'FRAGMENT'
+export LLVM_PREFIX="$(brew --prefix llvm 2>/dev/null || true)"
+export CC=clang
+export CXX=clang++
+
+# Switch into brew's vanilla LLVM (PATH + LDFLAGS + CPPFLAGS + CMAKE_PREFIX_PATH).
+# Apple's clang remains the default; this is opt-in per-shell, reversible.
+llvm_activate() {
+  [ -z "$LLVM_PREFIX" ]       && { echo "llvm_activate: brew llvm not installed" >&2; return 1; }
+  [ ! -d "$LLVM_PREFIX/bin" ] && { echo "llvm_activate: \$LLVM_PREFIX/bin not found" >&2; return 1; }
+  [ -n "${LLVM_OLD_PATH:-}" ] && { echo "llvm_activate: already active" >&2; return 1; }
+  LLVM_OLD_PATH="$PATH"
+  LLVM_OLD_LDFLAGS="${LDFLAGS:-}"
+  LLVM_OLD_CPPFLAGS="${CPPFLAGS:-}"
+  LLVM_OLD_CMAKE_PREFIX_PATH="${CMAKE_PREFIX_PATH:-}"
+  # If transparent ccache is active (its libexec dir is first on PATH), insert
+  # LLVM *after* it so ccache stays the first match. ccache will then re-look-up
+  # clang and find LLVM's clang, dispatching through the cache.
+  if [ -n "${CCACHE_LIBEXEC:-}" ] && [ "${PATH%%:*}" = "$CCACHE_LIBEXEC" ] ; then
+    PATH="$CCACHE_LIBEXEC:$LLVM_PREFIX/bin:${PATH#"$CCACHE_LIBEXEC":}"
+  else
+    PATH="$LLVM_PREFIX/bin:$PATH"
+  fi
+  LDFLAGS="-L$LLVM_PREFIX/lib"
+  CPPFLAGS="-I$LLVM_PREFIX/include"
+  CMAKE_PREFIX_PATH="$LLVM_PREFIX"
+  export PATH LDFLAGS CPPFLAGS CMAKE_PREFIX_PATH \
+         LLVM_OLD_PATH LLVM_OLD_LDFLAGS LLVM_OLD_CPPFLAGS LLVM_OLD_CMAKE_PREFIX_PATH
+  echo "llvm activated: $(clang --version | head -1)"
+}
+
+# Restore Apple's clang and clear LDFLAGS/CPPFLAGS/CMAKE_PREFIX_PATH overrides.
+llvm_deactivate() {
+  [ -z "${LLVM_OLD_PATH:-}" ] && { echo "llvm_deactivate: not active" >&2; return 1; }
+  PATH="$LLVM_OLD_PATH"
+  LDFLAGS="$LLVM_OLD_LDFLAGS"
+  CPPFLAGS="$LLVM_OLD_CPPFLAGS"
+  CMAKE_PREFIX_PATH="$LLVM_OLD_CMAKE_PREFIX_PATH"
+  unset LLVM_OLD_PATH LLVM_OLD_LDFLAGS LLVM_OLD_CPPFLAGS LLVM_OLD_CMAKE_PREFIX_PATH
+  export PATH LDFLAGS CPPFLAGS CMAKE_PREFIX_PATH
+  echo "llvm deactivated: $(clang --version | head -1)"
+}
+FRAGMENT
+  else
+    local major="$DEVENV_LLVM_MAJOR"
+
+    _apt_repo llvm \
+      "https://apt.llvm.org/llvm-snapshot.gpg.key" \
+      "http://apt.llvm.org/${_os_codename}/ llvm-toolchain-${_os_codename}-${major} main"
+
+    # lld packaged separately on apt.llvm.org — include alongside clang + llvm
+    sudo apt-get install -y "clang-${major}" "llvm-${major}" "lld-${major}"
+
+    sudo update-alternatives --install /usr/bin/clang   clang   "/usr/bin/clang-${major}"   100
+    sudo update-alternatives --install /usr/bin/clang++ clang++ "/usr/bin/clang++-${major}" 100
+    sudo update-alternatives --install /usr/bin/lld     lld     "/usr/bin/lld-${major}"     100
+
+    _env_fragment llvm 'export CC=clang' 'export CXX=clang++'
+  fi
+}
+
+# JDK sub-helpers
+
+_jdks_path() {
+  local vendor="$1" major="$2"
+  if _is_mac ; then
+    case "$vendor" in
+      adoptium) echo "/Library/Java/JavaVirtualMachines/temurin-${major}.jdk/Contents/Home" ;;
+      graalvm)  echo "/Library/Java/JavaVirtualMachines/graalvm-jdk-${major}.jdk/Contents/Home" ;;
+    esac
+  else
+    # Adoptium's apt package names the install dir with the Debian arch
+    # suffix (amd64, arm64, etc) — match dpkg's view, not the kernel's.
+    local deb_arch
+    deb_arch="$(dpkg --print-architecture)"
+    case "$vendor" in
+      adoptium) echo "/usr/lib/jvm/temurin-${major}-jdk-${deb_arch}" ;;
+      graalvm)  echo "$_install_root/jdks/graalvm-${major}" ;;
+    esac
+  fi
+}
+
+_jdks_adoptium_() {
+  local major="$1"
+  if _is_mac ; then
+    _cask "temurin@${major}"
+  else
+    _apt_repo adoptium \
+      "https://packages.adoptium.net/artifactory/api/gpg/key/public" \
+      "https://packages.adoptium.net/artifactory/deb ${_os_codename} main"
+    sudo apt-get install -y "temurin-${major}-jdk"
+  fi
+}
+
+_jdks_graalvm_() {
+  local major="$1"
+  if _is_mac ; then
+    _cask "graalvm-jdk@${major}"
+  else
+    _tarball "jdks/graalvm-${major}" "$major" \
+      deb:"https://download.oracle.com/graalvm/${major}/latest/graalvm-jdk-${major}_linux-x64_bin.tar.gz"
+  fi
+}
+
+_jdks_() {
+  _jdks_adoptium_ 21
+  _jdks_adoptium_ 25
+  _jdks_graalvm_  25
+
+  local default_path
+  case "$DEVENV_JDKS_DEFAULT" in
+    adoptium-21) default_path="$(_jdks_path adoptium 21)" ;;
+    adoptium-25) default_path="$(_jdks_path adoptium 25)" ;;
+    graalvm-25)  default_path="$(_jdks_path graalvm  25)" ;;
+    *)
+      echo "_jdks_: unknown DEVENV_JDKS_DEFAULT='$DEVENV_JDKS_DEFAULT', falling back to adoptium-21" >&2
+      default_path="$(_jdks_path adoptium 21)"
+      ;;
+  esac
+
+  _env_fragment jdks \
+    "export JAVA_HOME=\"$default_path\"" \
+    'export PATH="$JAVA_HOME/bin:$PATH"'
+}
+
+_gradle_() {
+  local ver="$DEVENV_GRADLE_VER"
+
+  _tarball gradle "$ver" \
+    all:"https://services.gradle.org/distributions/gradle-${ver}-bin.zip"
+
+  _link_bin gradle/bin gradle
+
+  # Discover all installed JDKs and write the toolchain paths to gradle.properties.
+  # (Sole owner of org.gradle.java.installations.paths per Issue #1.)
+  mkdir -p "$HOME/.gradle"
+  local paths
+  paths="$(_discover_jdks | sort -u | paste -sd, -)"
+  if [ -n "$paths" ] ; then
+    _gradle_properties_set org.gradle.java.installations.paths "$paths"
+  else
+    echo "_gradle_: no JDKs discovered — gradle.properties unchanged" >&2
+  fi
+}
+
+_maven_() { _pkg brew:maven apt:maven ; }
+
+_golang_() {
+  _pkg brew:go apt:golang-go
+  # Move GOPATH out of $HOME (XDG-style data location) so ~/go doesn't
+  # clutter home. GOMODCACHE ($GOPATH/pkg/mod) and GOBIN ($GOPATH/bin)
+  # derive from GOPATH automatically. The env fragment also puts
+  # $GOPATH/bin on PATH so `go install`'d tools work.
+  mkdir -p "$HOME/.local/share/go/bin"
+  _env_fragment golang \
+    'export GOPATH="$HOME/.local/share/go"' \
+    'export PATH="$GOPATH/bin:$PATH"'
+}
+
+_node_() {
+  local major="$DEVENV_NODE_MAJOR"
+
+  if _is_mac ; then
+    brew install "node@${major}"
+    local node_bin
+    node_bin="$(brew --prefix "node@${major}")/bin"
+    _env_fragment node "export PATH=\"${node_bin}:\$PATH\""
+    # Mid-run invocation via absolute path (brew's node@N is keg-only — not on PATH yet)
+    "${node_bin}/corepack" enable
+  else
+    _apt_repo nodesource \
+      "https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key" \
+      "https://deb.nodesource.com/node_${major}.x nodistro main"
+    sudo apt-get install -y nodejs
+    sudo corepack enable
+  fi
+}
+
+_python_() {
+  # uv (Astral) — Python toolchain manager: handles Python version install,
+  # virtualenvs, package install, lockfiles in one tool. Installed via the
+  # official installer on both OSes for parity (apt has no uv; brew has it
+  # but we prefer single code path + `uv self update`).
+  # UV_NO_MODIFY_PATH=1 keeps the installer from touching shell rc; we own
+  # PATH via the env loader (uv lands in ~/.local/bin, already prepended).
+  # (Replaces the previous `--no-modify-path` CLI flag, deprecated in uv 0.11.)
+  if [ ! -x "$HOME/.local/bin/uv" ] ; then
+    curl -LsSf https://astral.sh/uv/install.sh | UV_NO_MODIFY_PATH=1 sh
+  fi
+}
+
+_rust_() {
+  _pkg brew:rustup apt:rustup
+
+  # Idempotency guard via absolute path (~/.cargo/bin not on PATH yet — env fragment is for new shells)
+  if [ ! -x "$HOME/.cargo/bin/cargo" ] ; then
+    if _is_mac ; then
+      # brew's `rustup` formula provides only `rustup` (keg-only), NOT `rustup-init`.
+      # Use the keg's rustup directly to install the default toolchain.
+      local rustup_bin
+      rustup_bin="$(brew --prefix rustup)/bin/rustup"
+      "$rustup_bin" set profile "$DEVENV_RUST_PROFILE"
+      "$rustup_bin" toolchain install stable
+      "$rustup_bin" default stable
+    else
+      # Ubuntu's `rustup` apt package provides /usr/bin/rustup (NOT rustup-init;
+      # that name is only from the standalone curl|sh installer). Use rustup
+      # directly, same as the macOS branch above.
+      rustup set profile "$DEVENV_RUST_PROFILE"
+      rustup toolchain install stable
+      rustup default stable
+    fi
+  fi
+
+  # Env fragment: cargo bin always; on macOS, also brew's keg-only rustup bin so the user has `rustup` on PATH.
+  if _is_mac ; then
+    local rustup_prefix
+    rustup_prefix="$(brew --prefix rustup)"
+    _env_fragment rust "export PATH=\"${rustup_prefix}/bin:\$HOME/.cargo/bin:\$PATH\""
+  else
+    _env_fragment rust 'export PATH="$HOME/.cargo/bin:$PATH"'
+  fi
+}
+
+_helm_() {
+  # macOS: brew install helm.
+  # Linux: helm's official install script (get-helm-3) — pulls latest stable
+  # binary from GitHub releases, installs to /usr/local/bin/helm via sudo.
+  # We avoid helm's apt repo at baltocdn.com — it's been observed serving
+  # invalid/empty InRelease files (HTTP 204), breaking apt verification.
+  # The install script is the path helm.sh docs recommend as the alternative.
+  if _is_mac ; then
+    _pkg brew:helm
+  else
+    if [ ! -x /usr/local/bin/helm ] ; then
+      curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+      if [ ! -x /usr/local/bin/helm ] ; then
+        echo "_helm_: install reported success but /usr/local/bin/helm is missing." >&2
+        return 1
+      fi
+    fi
+  fi
+}
+
+_kubernetes_() {
+  # macOS: brew install kubernetes-cli. Linux: Kubernetes's pkgs.k8s.io apt repo
+  # (replaces deprecated apt.kubernetes.io as of 2024). Version-pinned by URL —
+  # bump v1.31 to a newer stable here when desired.
+  _apt_repo kubernetes \
+    "https://pkgs.k8s.io/core:/stable:/v1.31/deb/Release.key" \
+    "https://pkgs.k8s.io/core:/stable:/v1.31/deb/ /"
+  _pkg brew:kubernetes-cli apt:kubectl
+}
+
+_ollama_() {
+  # Locals (declared once at the top for bash 3.2 scope clarity)
+  local key val kv k v plist
+  local active_envs=()
+
+  # ---- Install ----
+  if _is_mac ; then
+    _pkg brew:ollama
+  else
+    # Official installer (curl-pipe-to-bash) — sets up systemd service automatically.
+    # Idempotency guard: absolute-path check (Issue #5).
+    if [ ! -x /usr/local/bin/ollama ] ; then
+      curl -fsSL https://ollama.com/install.sh | sh
+      if [ ! -x /usr/local/bin/ollama ] ; then
+        echo "_ollama_: install reported success but /usr/local/bin/ollama is missing." >&2
+        return 1
+      fi
+    fi
+  fi
+
+  # ---- Build active daemon env list ----
+  # Maps DEVENV_OLLAMA_<KEY> → OLLAMA_<KEY>. Extend this loop's `for` list to add
+  # more keys. Uses a case statement instead of ${!var} indirect expansion to
+  # stay bash-3.2-compatible (per Issue #6).
+  for key in HOST FLASH_ATTENTION KV_CACHE_TYPE ; do
+    case "$key" in
+      HOST)            val="$DEVENV_OLLAMA_HOST" ;;             # unset by default
+      FLASH_ATTENTION) val="$DEVENV_OLLAMA_FLASH_ATTENTION" ;;   # per brew caveat
+      KV_CACHE_TYPE)   val="$DEVENV_OLLAMA_KV_CACHE_TYPE" ;;  # per brew caveat
+    esac
+    if [ -n "$val" ] ; then
+      active_envs+=( "OLLAMA_${key}=${val}" )
+    fi
+  done
+
+  # ---- Persist daemon env (only matters when autostart=true) ----
+  # Mac: launchctl setenv for current session; plist EnvironmentVariables patched
+  # after brew services start (below) for persistence across logout/reboot.
+  # Linux: systemd drop-in override (persistent across unit-file regenerations).
+  if [ "$DEVENV_OLLAMA_AUTOSTART" = "true" ] && [ ${#active_envs[@]} -gt 0 ] ; then
+    if _is_mac ; then
+      for kv in "${active_envs[@]}" ; do
+        launchctl setenv "${kv%%=*}" "${kv#*=}"
+      done
+    else
+      sudo install -d /etc/systemd/system/ollama.service.d
+      {
+        echo "[Service]"
+        for kv in "${active_envs[@]}" ; do
+          echo "Environment=\"${kv}\""
+        done
+      } | sudo tee /etc/systemd/system/ollama.service.d/devenv.conf >/dev/null
+      sudo systemctl daemon-reload
+    fi
+  fi
+
+  # ---- Autostart ----
+  if [ "$DEVENV_OLLAMA_AUTOSTART" = "true" ] ; then
+    if _is_mac ; then
+      # brew services start is not idempotent — check launchd state first.
+      if launchctl print "gui/$(id -u)/homebrew.mxcl.ollama" >/dev/null 2>&1 ; then
+        echo "_ollama_: ollama already registered with launchd"
+      else
+        brew services start ollama
+      fi
+      # Plist exists now — patch EnvironmentVariables for persistence across logout.
+      # May be clobbered by `brew upgrade ollama` — rerun bootstrap to restore.
+      if [ ${#active_envs[@]} -gt 0 ] ; then
+        plist="$HOME/Library/LaunchAgents/homebrew.mxcl.ollama.plist"
+        if [ -f "$plist" ] ; then
+          /usr/libexec/PlistBuddy -c "Add :EnvironmentVariables dict" "$plist" 2>/dev/null || true
+          for kv in "${active_envs[@]}" ; do
+            k="${kv%%=*}"
+            v="${kv#*=}"
+            /usr/libexec/PlistBuddy -c "Add :EnvironmentVariables:${k} string '${v}'" "$plist" 2>/dev/null \
+              || /usr/libexec/PlistBuddy -c "Set :EnvironmentVariables:${k} '${v}'" "$plist"
+          done
+          # Reload the agent so new env vars take effect.
+          # `brew services restart` does unload + reload of the plist file (NOT
+          # just process restart with cached in-memory plist — that's what
+          # `launchctl kickstart -k` does, which would silently NOT pick up our
+          # PlistBuddy env-var edits). Trusts brew's accumulated edge-case
+          # handling over hand-rolled launchctl bootout+bootstrap.
+          brew services restart ollama
+        fi
+      fi
+    else
+      sudo systemctl enable --now ollama
+    fi
+  fi
+
+  # ---- Shell env fragment (for CLI + manually-started daemon) ----
+  if [ -n "$DEVENV_OLLAMA_MODELS_DIR" ] || [ ${#active_envs[@]} -gt 0 ] ; then
+    {
+      if [ -n "$DEVENV_OLLAMA_MODELS_DIR" ] ; then
+        echo "export OLLAMA_MODELS=\"${DEVENV_OLLAMA_MODELS_DIR}\""
+      fi
+      for kv in "${active_envs[@]}" ; do
+        echo "export ${kv%%=*}=\"${kv#*=}\""
+      done
+    } | _env_fragment ollama
+  fi
+}
+
+_vllm_() {
+  # vllm — high-throughput LLM serving framework.
+  # - macOS: vllm-metal (MLX-backed Apple Silicon plugin, ~83x TTFT improvement
+  #   over vanilla vllm with PyTorch MPS). Installs to ~/.venv-vllm-metal/.
+  #   install.sh handles all prereqs (ensures uv, creates Python 3.12 arm64 venv,
+  #   downloads + installs the wheel).
+  # - Linux: vanilla vllm via `uv tool install vllm` (uv shims the CLI onto PATH).
+  # Off by default — heavy install (~5-10 GB). Opt in via DEVENV_VLLM_INSTALL=true.
+  if [ "$DEVENV_VLLM_INSTALL" != "true" ] ; then
+    return 0
+  fi
+
+  if _is_mac ; then
+    if [ ! -d "$HOME/.venv-vllm-metal" ] ; then
+      curl -fsSL https://raw.githubusercontent.com/vllm-project/vllm-metal/main/install.sh | bash
+    fi
+    # Defensive post-install check (sibling to _hf_): the installer may print
+    # errors but exit 0, so verify the binary actually exists.
+    if [ ! -x "$HOME/.venv-vllm-metal/bin/vllm" ] ; then
+      echo "_vllm_: install reported success but \$HOME/.venv-vllm-metal/bin/vllm is missing." >&2
+      return 1
+    fi
+    # Symlink CLI onto PATH. The vllm script's shebang is the venv's python
+    # (absolute path), so invocation via symlink uses the correct interpreter + deps.
+    ln -sfn "$HOME/.venv-vllm-metal/bin/vllm" "$HOME/.local/bin/vllm"
+  else
+    if [ ! -x "$HOME/.local/bin/uv" ] ; then
+      echo "_vllm_: uv not found at \$HOME/.local/bin/uv — _python_ must run first" >&2
+      return 1
+    fi
+    "$HOME/.local/bin/uv" tool install vllm
+  fi
+}
+
+_docker_() {
+  if _is_mac ; then
+    brew install colima docker docker-compose docker-buildx docker-credential-helper
+
+    local cpus="$DEVENV_COLIMA_CPUS"
+    local memory="$DEVENV_COLIMA_MEMORY"
+    local disk="$DEVENV_COLIMA_DISK"
+    local autostart="$DEVENV_COLIMA_AUTOSTART"
+    local kubernetes="$DEVENV_COLIMA_KUBERNETES"
+
+    local args=( --cpu "$cpus" --memory "$memory" --disk "$disk" )
+    if [ "$kubernetes" = "true" ] ; then
+      args+=( --kubernetes )
+    fi
+
+    if [ "$autostart" = "true" ] ; then
+      echo "_docker_: starting colima VM (first run: ~5 min for image download + provisioning)..."
+      colima start "${args[@]}"
+      # brew services start is not idempotent: returns launchctl exit 5
+      # ("Input/output error") if the agent is already loaded by launchd.
+      # Detect already-registered state and skip the brew services call.
+      if launchctl print "gui/$(id -u)/homebrew.mxcl.colima" >/dev/null 2>&1 ; then
+        echo "_docker_: colima already registered with launchd (will auto-start at login)"
+      else
+        brew services start colima
+      fi
+    else
+      echo "_docker_: colima installed. To start the VM now:"
+      echo "  colima start ${args[*]}"
+      echo "(first run takes ~5 min)"
+    fi
+    return
+  fi
+
+  # Debian
+  _apt_repo docker \
+    "https://download.docker.com/linux/ubuntu/gpg" \
+    "https://download.docker.com/linux/ubuntu ${_os_codename} stable"
+
+  sudo apt-get install -y \
+    docker-ce docker-ce-cli containerd.io \
+    docker-buildx-plugin docker-compose-plugin
+
+  sudo groupadd -f docker
+  sudo usermod -aG docker "$USER"
+  sudo systemctl enable --now docker containerd
+  echo "_docker_: log out and back in for docker group membership to take effect"
+}
+
+
+# =============================================================================
+# Closing message
+# =============================================================================
+
+_print_next_steps() {
+  echo
+  echo "================================================================"
+  echo "  bootstrap complete — next steps"
+  echo "================================================================"
+  echo
+  echo "  • Start a new shell, or run:"
+  echo "      source \"\$HOME/.config/dev-env/env.sh\""
+  echo "    to load PATH and env-fragments in your current shell."
+  echo
+
+  if _is_debian ; then
+    echo "  • Linux: log out and back in for 'docker' group membership"
+    echo "    to take effect (or run 'newgrp docker' in current shell)."
+    echo
+  fi
+
+  if _is_mac && [ "$DEVENV_COLIMA_AUTOSTART" != "true" ] ; then
+    local colima_flags="--cpu $DEVENV_COLIMA_CPUS --memory $DEVENV_COLIMA_MEMORY --disk $DEVENV_COLIMA_DISK"
+    if [ "$DEVENV_COLIMA_KUBERNETES" = "true" ] ; then
+      colima_flags="$colima_flags --kubernetes"
+    fi
+    echo "  • macOS: start the colima VM with:"
+    echo "      colima start $colima_flags"
+    echo "    (first run downloads the Lima image — ~5 min)"
+    echo
+  fi
+
+  echo "  • Authenticate gh CLI:"
+  echo "      gh auth login"
+  echo
+  echo "================================================================"
+}
+
+
+# =============================================================================
+# Pre-bootstrap confirmation prompt
+# (_show_effective_config is defined alongside the manifest near the top.)
+# =============================================================================
+
+_confirm_proceed() {
+  _show_effective_config
+  if [ "$__yes" = "true" ] ; then
+    echo "(--yes passed — proceeding without confirmation)"
+    echo
+    return 0
+  fi
+  if [ ! -t 0 ] ; then
+    echo "bootstrap: non-interactive (no tty); pass --yes to proceed" >&2
+    exit 1
+  fi
+  printf 'Proceed with bootstrap? [y/N] '
+  local reply
+  read -r reply
+  case "${reply:-}" in
+    [yY]|[yY][eE][sS]) ;;
+    *)
+      echo "bootstrap: aborted by user" >&2
+      exit 0
+      ;;
+  esac
+  echo
+}
+
+
+# =============================================================================
+# Main — DEPS array order is intentional (per Issue #4):
+#   framework → OS prereqs → identity/keys → VCS → C/C++ → JVM → other langs
+#   → k8s → docker last
+# =============================================================================
+
+DEPS=(
+  base
+  sys
+  bash       # macOS only: brew bash 5+ alongside Apple's frozen 3.2
+  gpg
+  ssh
+  git
+  gh
+  hf         # Hugging Face CLI (after gh sibling, before ollama/vllm which consume HF models)
+  ccache
+  cmake
+  ninja
+  boost
+  llvm
+  jdks
+  gradle
+  maven
+  golang
+  node
+  rust
+  python     # uv (Astral) — Python toolchain manager; future _vllm_ depends on this
+  helm
+  kubernetes
+  docker
+  ollama     # local LLM runtime (headless via brew on Mac, official systemd installer on Linux)
+  vllm       # LLM serving framework (vllm-metal on Mac, vanilla vllm on Linux); opt-in via DEVENV_VLLM_INSTALL
+)
+
+_confirm_proceed
+
+for dep in "${DEPS[@]}" ; do
+  echo
+  echo "==> ${dep}"
+  "_${dep}_"
+done
+
+_print_next_steps
