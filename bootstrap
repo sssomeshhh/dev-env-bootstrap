@@ -1253,6 +1253,25 @@ _docker_() {
   if _is_mac ; then
     brew install colima docker docker-compose docker-buildx docker-credential-helper
 
+    # Register Homebrew plugin dir so "docker compose" subcommand works
+    mkdir -p "$HOME/.docker"
+    python3 - "$HOME/.docker/config.json" "/opt/homebrew/lib/docker/cli-plugins" << 'PYEOF'
+import json, sys
+cfg_path, plug_dir = sys.argv[1], sys.argv[2]
+try:
+    with open(cfg_path) as f:
+        cfg = json.load(f)
+except (IOError, ValueError):
+    cfg = {}
+dirs = cfg.get("cliPluginsExtraDirs", [])
+if plug_dir not in dirs:
+    dirs.append(plug_dir)
+    cfg["cliPluginsExtraDirs"] = dirs
+    with open(cfg_path, "w") as f:
+        json.dump(cfg, f, indent=2)
+        f.write("\n")
+PYEOF
+
     local cpus="$DEVENV_COLIMA_CPUS"
     local memory="$DEVENV_COLIMA_MEMORY"
     local disk="$DEVENV_COLIMA_DISK"
